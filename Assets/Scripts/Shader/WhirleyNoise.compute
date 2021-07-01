@@ -1,0 +1,159 @@
+﻿#pragma kernel CreateNoiseTexture
+#pragma kernel Debug
+#pragma kernel Clear
+
+struct Point{
+    float2 position;
+};
+
+RWStructuredBuffer<Point> points;
+RWStructuredBuffer<float> distances;
+RWStructuredBuffer<float> groupDistances;
+RWStructuredBuffer<float2> debug;
+RWStructuredBuffer<float> maxMinDistance;
+RWStructuredBuffer<float2> directions;
+RWTexture2D<float4> result;
+uint directionsCount;
+uint pointCount;
+uint size;
+uint groupX;
+uint groupY;
+
+//stores the *groups* maximum thread values
+//as each group has its own values, the variable is groupshared (= shared within the thread group)
+groupshared float maxThreadDistances[16*16];
+
+
+uint IsInGrid(int2 nPos, uint gridSize) {
+    return  nPos.x >= 0 &&
+            nPos.y >= 0 &&
+            nPos.x < (int)gridSize &&
+            nPos.y < (int)gridSize 
+            ? 1 : 0;
+}
+
+float GetMinDistanceForPixel(uint2 pixel){
+    //we could check every other pixel for distance, but if we arrange them in a grid
+    //we can only check the adjacent grid spaces
+    uint gridSize = sqrt(pointCount);
+    uint2 gridPos = (uint2)(pixel / (float)size * gridSize);
+    
+    float minDistance = 999999;
+    for (uint i = 0; i < directionsCount; i++) {
+        int2 nPos = gridPos + directions[i];
+        if (IsInGrid(nPos, gridSize) > 0) {
+            uint index = nPos.y * gridSize + nPos.x;
+            uint2 otherPixel = points[index].position;
+            minDistance = min(minDistance, distance(pixel, otherPixel));
+        }
+        else {
+            uint2 wrappedNPos = (uint2)(nPos + (int2)gridSize) % (uint2)gridSize;
+            uint index = wrappedNPos.y * gridSize + wrappedNPos.x;
+            uint2 otherPixel = points[index].position;
+            int2 offset;
+            offset.x = nPos.x >= (int)gridSize || nPos.x < 0 ? directions[i].x * size : 0;
+            offset.y = nPos.y >= (int)gridSize || nPos.y < 0 ? directions[i].y * size : 0;
+            int2 wrappedPixel = otherPixel + offset;
+            minDistance = min(minDistance, distance(pixel, wrappedPixel));
+        }
+    }
+
+    return minDistance;
+            
+}
+
+float GetMinDistanceForPixelBad(uint2 pixel){
+    float minDistance = 99999;
+    for(uint i = 0; i < pointCount; i++){
+        float dis = abs(distance(points[i].position, pixel));
+        minDistance = min(minDistance, dis);
+    }
+    return minDistance;
+}
+
+float ComputeValues (uint2 index, uint2 amountPerGroup, uint2 amountPerThread)
+{
+    //each thread has a maximum minimum distance, which will be combined into the global max
+    float threadMaxMinDistance = -1;
+    for(uint y = index.y; y < index.y + amountPerThread.y; y++){
+        for(uint x = index.x; x < index.x + amountPerThread.x; x++){
+            //optimised distance check for each pixel
+            float minDistance = GetMinDistanceForPixel(index) / (float) size;
+            distances[y * size + x] = minDistance;
+            threadMaxMinDistance = max(minDistance, threadMaxMinDistance);
+        }
+    }
+    return threadMaxMinDistance;
+}
+
+
+
+void NormalValues(uint2 index, uint2 amountPerGroup, uint2 amountPerThread){
+    //reiterate over the existing values and inverse scale them accoring to the max distance
+    for(uint y = index.y; y < index.y + amountPerThread.y; y++){
+        for(uint x = index.x; x < index.x + amountPerThread.x; x++){
+            result[uint2(x, y)] = clamp(1 - distances[y * size + x] / maxMinDistance[0], 0, 1);
+        }
+    }
+}
+
+[numthreads(16, 16, 1)]
+void CreateNoiseTexture (uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+{
+    //find from which pixels we have to start, according to group and thread size
+    uint2 amountPerGroup = uint2(size / groupX, size / groupY);
+    uint2 amountPerThread = uint2(amountPerGroup.x / 16, amountPerGroup.y / 16);
+
+    uint2 index = uint2(groupID.x * amountPerGroup.x, groupID.y * amountPerGroup.y);
+    index += uint2(threadID.x * amountPerThread.x, threadID.y * amountPerThread.y);
+
+    uint threadIndex = threadID.y * 16 + threadID.x;
+    uint groupIndex = groupID.y * groupX + groupID.x;
+    maxThreadDistances[threadIndex] = ComputeValues(index, amountPerGroup, amountPerThread);
+    //debug[groupID.y * groupX + groupID.x + threadID.y * 16 + threadID.x] = maxThreadDistances[threadIndex];
+
+    //every thread has its own max value, we need to combine them to find the global maximum
+    //this maximum can then be used to normalize every distance, so that the color range is 0..1
+    //wait for every thread in group to sync
+    GroupMemoryBarrierWithGroupSync();
+    if(threadIndex == 0){
+        float groupMax = -1;
+        for(uint i = 0; i < 16 * 16; i++){
+            groupMax = max(groupMax, maxThreadDistances[i]);
+        }
+        groupDistances[groupIndex] = groupMax;
+    }
+    //wait for every group to sync
+    GroupMemoryBarrierWithGroupSync();
+    if(groupIndex == 0 && threadIndex == 0){
+        for(uint i = 0; i < groupX * groupY; i++){
+            maxMinDistance[0] = max(maxMinDistance[0], groupDistances[i]);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    NormalValues(index, amountPerGroup, amountPerThread);
+}
+
+//each thread sets a certain amount of pixels black, in a checker pattern
+[numthreads(16, 16, 1)]
+void Clear (uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+{
+    uint2 amountPerGroup = uint2(size / groupX, size / groupY);
+    uint2 amountPerThread = uint2(amountPerGroup.x / 16, amountPerGroup.y / 16);
+
+    uint2 index = uint2(groupID.x * amountPerGroup.x, groupID.y * amountPerGroup.y);
+    index += uint2(threadID.x * amountPerThread.x, threadID.y * amountPerThread.y);
+    for(uint y = index.y; y < index.y + amountPerThread.y; y++){
+        for(uint x = index.x; x < index.x + amountPerThread.x; x++){
+            result[uint2(x, y)] = float4(0,0,0,1);
+        }
+    }
+}
+
+[numthreads(1, 1, 1)]
+void Debug (uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+{
+    for(uint i = 0; i < pointCount; i++){
+        result[points[i].position] = float4(1, 0, 0, 1);
+    }
+}
